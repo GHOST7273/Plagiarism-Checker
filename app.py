@@ -32,7 +32,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Paraphrasing model
 print("Loading paraphrasing model...")
-paraphrase_tokenizer = AutoTokenizer.from_pretrained("Vamsi/T5_Paraphrase_Paws")
+# Use slow tokenizer to avoid SentencePiece conversion issues
+paraphrase_tokenizer = AutoTokenizer.from_pretrained("Vamsi/T5_Paraphrase_Paws", use_fast=False)
 paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained("Vamsi/T5_Paraphrase_Paws")
 
 # GPT-2 for AI detection
@@ -89,26 +90,43 @@ def compute_tfidf_similarities(query_text, reference_texts):
 
 def get_matching_snippets(query, reference, cutoff=0.6, max_snippets=5):
     """
-    Simple heuristic: use difflib to find matching blocks and return snippets
-    cutoff = minimum ratio for a matching block
+    Use difflib to find matching blocks and return snippets.
+    cutoff = minimum similarity ratio for a matching block (per-snippet, not global)
     """
     matcher = difflib.SequenceMatcher(None, query, reference)
     blocks = matcher.get_matching_blocks()
     snippets = []
-    for b in reversed(blocks):  # reversed: longer matches usually near end; we'll filter
+    
+    # Sort blocks by size (largest first) to prioritize significant matches
+    sorted_blocks = sorted(blocks, key=lambda b: b[2], reverse=True)
+    
+    for b in sorted_blocks:
         i, j, size = b
         if size <= 20:  # ignore tiny matches (tunable)
             continue
-        match = query[i:i+size].strip()
-        ratio = matcher.ratio()
+        
+        # Compute similarity for THIS specific snippet, not the entire document
+        snippet_text = query[i:i+size].strip()
+        if not snippet_text:
+            continue
+            
+        # Create a matcher just for this snippet to get its similarity
+        snippet_matcher = difflib.SequenceMatcher(None, snippet_text, reference)
+        ratio = snippet_matcher.ratio()
+        
+        # Apply cutoff filter - only include snippets above threshold
+        if ratio < cutoff:
+            continue
+        
         # record snippet with context
         start = max(0, i-40)
         end = min(len(query), i+size+40)
         context = query[start:end].replace('\n', ' ')
         snippets.append({
-            'match': match,
+            'match': snippet_text,
             'context': context,
-            'match_length': size
+            'match_length': size,
+            'similarity': ratio  # Include similarity score for transparency
         })
         if len(snippets) >= max_snippets:
             break
@@ -116,26 +134,49 @@ def get_matching_snippets(query, reference, cutoff=0.6, max_snippets=5):
 
 def compute_exact_coverage(query, reference):
     """
-    Very simple: slide over query in windows and check for substring presence.
-    Returns fraction of characters (approx) of query that appear verbatim in reference.
+    Slide over query in smaller windows and check for substring presence.
+    Returns fraction of characters of query that appear verbatim in reference.
+    Uses smaller windows and better stepping to catch more matches.
     """
+    if not query or not reference:
+        return 0.0
+    
     q = query
     ref = reference
-    total = 0
-    matched = 0
-    window = 50  # characters; tune as needed
+    total_chars = len(q)
+    matched_chars = 0
+    
+    # Use smaller window size for better granularity
+    window = 20  # characters; smaller window catches more matches
+    step = 5  # step size for sliding window
+    
     i = 0
+    matched_positions = set()  # Track which character positions are matched
+    
     while i < len(q):
-        total += min(window, len(q) - i)
-        segment = q[i:i+window]
-        if segment.strip() and segment in ref:
-            matched += len(segment)
-            i += window  # skip ahead if matched
+        # Try different window sizes from current position
+        for win_size in [window, window + 10, window + 20]:
+            if i + win_size > len(q):
+                continue
+            segment = q[i:i+win_size].strip()
+            if segment and len(segment) >= 10:  # Minimum meaningful segment
+                if segment in ref:
+                    # Mark these character positions as matched
+                    for pos in range(i, min(i + win_size, len(q))):
+                        matched_positions.add(pos)
+                    i += step  # Move forward after match
+                    break
         else:
-            i += int(window/4)  # step smaller to find overlaps
-    if total == 0:
+            # No match found at this position, try next
+            i += step
+    
+    # Count unique matched positions
+    matched_chars = len(matched_positions)
+    
+    if total_chars == 0:
         return 0.0
-    return matched / total
+    
+    return matched_chars / total_chars
 
 # ---------------------------
 # AI-detection using GPT-2 perplexity heuristic
@@ -429,6 +470,8 @@ PLAGIARISM_HTML = NAVIGATION_HTML + """
     <div class="result-box">
         <h3>Overall Plagiarism Summary</h3>
         <p><strong>Max TF-IDF similarity against any reference:</strong> {{ results.max_tfidf|round(3) }}</p>
+        <p><strong>Average exact coverage across all references:</strong> {{ (results.avg_coverage*100)|round(2) }}%</p>
+        <p><strong>Max exact coverage (best match):</strong> {{ (results.max_coverage*100)|round(2) }}%</p>
         <p><strong>Estimated plagiarism percent (heuristic):</strong> {{ (results.estimated_plagiarism*100)|round(2) }}%</p>
 
         <h3>Per-reference details</h3>
@@ -440,7 +483,12 @@ PLAGIARISM_HTML = NAVIGATION_HTML + """
                     <li>Top matching snippets:
                         <ul>
                             {% for s in r.snippets %}
-                                <li><code>{{ s.context }}</code></li>
+                                <li>
+                                    <code>{{ s.context }}</code>
+                                    {% if s.similarity is defined %}
+                                        <span style="color: #666; font-size: 0.9em;">(similarity: {{ s.similarity|round(3) }})</span>
+                                    {% endif %}
+                                </li>
                             {% endfor %}
                         </ul>
                     </li>
@@ -522,13 +570,13 @@ def plagiarism_check():
         sims = compute_tfidf_similarities(query, reference_texts) if reference_texts else []
         per_reference = []
         max_tfidf = 0.0
-        total_coverage = 0.0
+        coverage_scores = []  # Collect all coverage scores
         for idx, r in enumerate(refs):
             tfidf_score = float(sims[idx]) if len(sims) > idx else 0.0
             if tfidf_score > max_tfidf:
                 max_tfidf = tfidf_score
             coverage = compute_exact_coverage(query, reference_texts[idx])
-            total_coverage = max(total_coverage, coverage)
+            coverage_scores.append(coverage)
             snippets = get_matching_snippets(query, reference_texts[idx], cutoff=tfidf_thresh)
             per_reference.append({
                 'filename': r['filename'],
@@ -537,9 +585,21 @@ def plagiarism_check():
                 'snippets': snippets
             })
 
+        # Calculate average coverage across all references (more accurate than max)
+        avg_coverage = sum(coverage_scores) / len(coverage_scores) if coverage_scores else 0.0
+        max_coverage = max(coverage_scores) if coverage_scores else 0.0
+        
         # Estimate plagiarism percentage (heuristic combination)
-        # Weighted sum of max TF-IDF similarity (0-1) and exact coverage (0-1)
-        estimated = 0.6 * max_tfidf + 0.4 * total_coverage
+        # Use weighted combination: max TF-IDF (shows best match) and average coverage (shows overall similarity)
+        # If no references, default to 0
+        if len(refs) == 0:
+            estimated = 0.0
+        else:
+            # Weighted average: 60% max TF-IDF, 40% average coverage
+            # Add small boost if max coverage is high (indicates strong verbatim match)
+            estimated = 0.5 * max_tfidf + 0.3 * avg_coverage + 0.2 * max_coverage
+            # Ensure it's capped at 1.0
+            estimated = min(estimated, 1.0)
 
         # AI detection
         ppl_thresh = float(request.form.get('ppl_thresh', 40.0))
@@ -551,6 +611,8 @@ def plagiarism_check():
         results = {
             'per_reference': per_reference,
             'max_tfidf': max_tfidf,
+            'avg_coverage': avg_coverage,
+            'max_coverage': max_coverage,
             'estimated_plagiarism': estimated,
             'ai_flags': ai_flags,
             'ppl_thresh': ppl_thresh,
