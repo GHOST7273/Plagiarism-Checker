@@ -30,6 +30,8 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 # Model Loading
 # ---------------------------
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+PARAPHRASE_MODEL_NAME = os.getenv("PARAPHRASE_MODEL_NAME", "humarin/chatgpt_paraphraser_on_T5_small")
+AI_DETECT_MODEL_NAME = os.getenv("AI_DETECT_MODEL_NAME", "distilgpt2")
 
 # Lazy model globals
 paraphrase_tokenizer = None
@@ -53,14 +55,13 @@ def ensure_models_loaded():
         if _models_loaded and paraphrase_tokenizer and paraphrase_model and tokenizer_gpt2 and model_gpt2:
             return
 
-        print("Loading paraphrasing model (lazy)...")
-        paraphrase_tokenizer = AutoTokenizer.from_pretrained("Vamsi/T5_Paraphrase_Paws", use_fast=False)
-        paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained("Vamsi/T5_Paraphrase_Paws")
+        print(f"Loading paraphrasing model (lazy): {PARAPHRASE_MODEL_NAME}")
+        paraphrase_tokenizer = AutoTokenizer.from_pretrained(PARAPHRASE_MODEL_NAME, use_fast=False)
+        paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained(PARAPHRASE_MODEL_NAME)
 
-        print("Loading GPT-2 model for AI detection (lazy)...")
-        gpt2_model_name = "gpt2"
-        tokenizer_gpt2 = AutoTokenizer.from_pretrained(gpt2_model_name)
-        model_gpt2 = AutoModelForCausalLM.from_pretrained(gpt2_model_name).to(device)
+        print(f"Loading AI detection model (lazy): {AI_DETECT_MODEL_NAME}")
+        tokenizer_gpt2 = AutoTokenizer.from_pretrained(AI_DETECT_MODEL_NAME)
+        model_gpt2 = AutoModelForCausalLM.from_pretrained(AI_DETECT_MODEL_NAME).to(device)
         model_gpt2.eval()
 
         _models_loaded = True
@@ -104,7 +105,11 @@ def compute_tfidf_similarities(query_text, reference_texts):
     returns list of (source_index, cosine_sim) where higher is more similar
     """
     corpus = [query_text] + reference_texts
-    vectorizer = TfidfVectorizer(ngram_range=(1,3), stop_words='english')
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2),
+        stop_words='english',
+        max_features=5000
+    )
     tfidf = vectorizer.fit_transform(corpus)
     query_vec = tfidf[0]
     refs = tfidf[1:]
