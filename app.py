@@ -1,6 +1,7 @@
 import os
 import io
 import math
+import threading
 from datetime import datetime
 from flask import Flask, request, render_template_string, redirect, url_for, send_file
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -26,27 +27,49 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # ---------------------------
-# Load Models
+# Model Loading
 # ---------------------------
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Paraphrasing model
-print("Loading paraphrasing model...")
-# Use slow tokenizer to avoid SentencePiece conversion issues
-paraphrase_tokenizer = AutoTokenizer.from_pretrained("Vamsi/T5_Paraphrase_Paws", use_fast=False)
-paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained("Vamsi/T5_Paraphrase_Paws")
+# Lazy model globals
+paraphrase_tokenizer = None
+paraphrase_model = None
+tokenizer_gpt2 = None
+model_gpt2 = None
+_model_lock = threading.Lock()
+_models_loaded = False
 
-# GPT-2 for AI detection
-print("Loading GPT-2 model for AI detection...")
-gpt2_model_name = "gpt2"
-tokenizer_gpt2 = AutoTokenizer.from_pretrained(gpt2_model_name)
-model_gpt2 = AutoModelForCausalLM.from_pretrained(gpt2_model_name).to(device)
-model_gpt2.eval()
+
+def ensure_models_loaded():
+    """
+    Lazily load heavy ML models. Prevents Render startup timeouts by loading on first request.
+    """
+    global paraphrase_tokenizer, paraphrase_model, tokenizer_gpt2, model_gpt2, _models_loaded
+
+    if _models_loaded and paraphrase_tokenizer and paraphrase_model and tokenizer_gpt2 and model_gpt2:
+        return
+
+    with _model_lock:
+        if _models_loaded and paraphrase_tokenizer and paraphrase_model and tokenizer_gpt2 and model_gpt2:
+            return
+
+        print("Loading paraphrasing model (lazy)...")
+        paraphrase_tokenizer = AutoTokenizer.from_pretrained("Vamsi/T5_Paraphrase_Paws", use_fast=False)
+        paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained("Vamsi/T5_Paraphrase_Paws")
+
+        print("Loading GPT-2 model for AI detection (lazy)...")
+        gpt2_model_name = "gpt2"
+        tokenizer_gpt2 = AutoTokenizer.from_pretrained(gpt2_model_name)
+        model_gpt2 = AutoModelForCausalLM.from_pretrained(gpt2_model_name).to(device)
+        model_gpt2.eval()
+
+        _models_loaded = True
 
 # ---------------------------
 # Paraphrasing Functions
 # ---------------------------
 def paraphrase_text(sentence):
+    ensure_models_loaded()
     text = "paraphrase: " + sentence + " </s>"
     encoding = paraphrase_tokenizer.encode_plus(text, padding='longest', return_tensors="pt")
     input_ids, attention_masks = encoding["input_ids"], encoding["attention_mask"]
@@ -186,6 +209,7 @@ def perplexity_of_text(text):
     Compute approximate perplexity of a piece of text using GPT-2.
     Returns float (lower -> more likely under GPT-2).
     """
+    ensure_models_loaded()
     enc = tokenizer_gpt2(text, return_tensors='pt', truncation=True, max_length=1024)
     input_ids = enc.input_ids.to(device)
     with torch.no_grad():
