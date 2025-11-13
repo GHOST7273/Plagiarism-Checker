@@ -30,8 +30,10 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 # Model Loading
 # ---------------------------
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-PARAPHRASE_MODEL_NAME = os.getenv("PARAPHRASE_MODEL_NAME", "humarin/chatgpt_paraphraser_on_T5_small")
-AI_DETECT_MODEL_NAME = os.getenv("AI_DETECT_MODEL_NAME", "distilgpt2")
+DEFAULT_PARAPHRASE_MODEL = "Vamsi/T5_Paraphrase_Paws"
+DEFAULT_AI_DETECT_MODEL = "sshleifer/tiny-gpt2"
+PARAPHRASE_MODEL_NAME = os.getenv("PARAPHRASE_MODEL_NAME", DEFAULT_PARAPHRASE_MODEL)
+AI_DETECT_MODEL_NAME = os.getenv("AI_DETECT_MODEL_NAME", DEFAULT_AI_DETECT_MODEL)
 
 # Lazy model globals
 paraphrase_tokenizer = None
@@ -55,13 +57,33 @@ def ensure_models_loaded():
         if _models_loaded and paraphrase_tokenizer and paraphrase_model and tokenizer_gpt2 and model_gpt2:
             return
 
-        print(f"Loading paraphrasing model (lazy): {PARAPHRASE_MODEL_NAME}")
-        paraphrase_tokenizer = AutoTokenizer.from_pretrained(PARAPHRASE_MODEL_NAME, use_fast=False)
-        paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained(PARAPHRASE_MODEL_NAME)
+        try:
+            print(f"Loading paraphrasing model (lazy): {PARAPHRASE_MODEL_NAME}")
+            paraphrase_tokenizer = AutoTokenizer.from_pretrained(PARAPHRASE_MODEL_NAME, use_fast=False)
+            paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained(PARAPHRASE_MODEL_NAME)
+        except Exception as exc:
+            if PARAPHRASE_MODEL_NAME != DEFAULT_PARAPHRASE_MODEL:
+                fallback = DEFAULT_PARAPHRASE_MODEL
+                print(f"Warning: failed to load '{PARAPHRASE_MODEL_NAME}' ({exc}). "
+                      f"Falling back to '{fallback}'.")
+                paraphrase_tokenizer = AutoTokenizer.from_pretrained(fallback, use_fast=False)
+                paraphrase_model = AutoModelForSeq2SeqLM.from_pretrained(fallback)
+            else:
+                raise
 
-        print(f"Loading AI detection model (lazy): {AI_DETECT_MODEL_NAME}")
-        tokenizer_gpt2 = AutoTokenizer.from_pretrained(AI_DETECT_MODEL_NAME)
-        model_gpt2 = AutoModelForCausalLM.from_pretrained(AI_DETECT_MODEL_NAME).to(device)
+        try:
+            print(f"Loading AI detection model (lazy): {AI_DETECT_MODEL_NAME}")
+            tokenizer_gpt2 = AutoTokenizer.from_pretrained(AI_DETECT_MODEL_NAME)
+            model_gpt2 = AutoModelForCausalLM.from_pretrained(AI_DETECT_MODEL_NAME).to(device)
+        except Exception as exc:
+            if AI_DETECT_MODEL_NAME != DEFAULT_AI_DETECT_MODEL:
+                fallback = DEFAULT_AI_DETECT_MODEL
+                print(f"Warning: failed to load '{AI_DETECT_MODEL_NAME}' ({exc}). "
+                      f"Falling back to '{fallback}'.")
+                tokenizer_gpt2 = AutoTokenizer.from_pretrained(fallback)
+                model_gpt2 = AutoModelForCausalLM.from_pretrained(fallback).to(device)
+            else:
+                raise
         model_gpt2.eval()
 
         _models_loaded = True
